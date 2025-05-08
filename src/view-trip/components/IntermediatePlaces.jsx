@@ -46,199 +46,233 @@
 // export default IntermediatePlaces;
 
 
+
 import React, { useEffect, useState } from 'react';
 import { FaMapMarkerAlt, FaRoute, FaInfoCircle, FaSpinner } from 'react-icons/fa';
 import axios from 'axios';
 import PlaceCardItem from './PlaceCardItem';
+import { chatSession } from '../service/AIModel';
 
-// API key from environment variable
+// API key for Google Maps
 const API_KEY = "AIzaSyAf0ZvcA5XmS5iVs33z9lWbxQlGrTREdBo";
 
 function IntermediatePlaces({ trip }) {
-  const [validIntermediatePlaces, setValidIntermediatePlaces] = useState([]);
+  const [intermediateOptions, setIntermediateOptions] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState(null);
 
   useEffect(() => {
-    // Check if intermediate places exist
+    // Check if we already have intermediate places
     const hasIntermediatePlaces = 
       trip?.tripData?.intermediate_places && 
       Array.isArray(trip.tripData.intermediate_places) && 
       trip.tripData.intermediate_places.length > 0;
     
-    if (!hasIntermediatePlaces) {
-      setValidIntermediatePlaces([]);
+    // If we already have places, use those
+    if (hasIntermediatePlaces) {
+      setIntermediateOptions(trip.tripData.intermediate_places);
       setIsLoading(false);
       return;
     }
+    
+    // Only proceed if we have source and destination
+    if (!trip?.userSelection?.source?.label || !trip?.userSelection?.location?.label) {
+      setIsLoading(false);
+      setError("Source or destination is missing");
+      return;
+    }
 
-    async function validateIntermediatePlaces() {
+    const fetchInterestingPlaces = async () => {
       setIsLoading(true);
       setError(null);
       
       try {
-        // Get source and destination
-        const source = trip?.userSelection?.source?.label;
-        const destination = trip?.userSelection?.location?.label;
+        const source = trip.userSelection.source.label;
+        const destination = trip.userSelection.location.label;
         
-        if (!source || !destination) {
-          throw new Error("Source or destination is missing");
+        console.log(`Finding interesting places between ${source} and ${destination}`);
+        
+        // Prepare the prompt for OpenAI
+        const prompt = generateOpenAIPrompt(source, destination);
+        
+        // Get places recommendations from OpenAI
+        const aiResult = await getPlacesFromOpenAI(prompt);
+        
+        // If AI returned valid places, use them
+        if (aiResult && aiResult.length > 0) {
+          // Validate and enhance places with Geocoding API
+          const validatedPlaces = await validatePlacesWithGeocoding(aiResult, source, destination);
+          setIntermediateOptions(validatedPlaces);
+        } else {
+          // Fallback to manual data
+          const fallbackPlaces = getManualPlacesAlongRoute(source, destination);
+          setIntermediateOptions(fallbackPlaces);
         }
-
-        // Get coordinates for source
-        const sourceCoords = await getCoordinatesFromAddress(source);
-        if (!sourceCoords) {
-          throw new Error(`Could not get coordinates for source: ${source}`);
-        }
-
-        // Get coordinates for destination
-        const destCoords = await getCoordinatesFromAddress(destination);
-        if (!destCoords) {
-          throw new Error(`Could not get coordinates for destination: ${destination}`);
-        }
-
-        console.log(`Source coordinates: ${sourceCoords.lat},${sourceCoords.lng}`);
-        console.log(`Destination coordinates: ${destCoords.lat},${destCoords.lng}`);
-
-        // Calculate route distance for relative buffer sizing
-        const routeDistance = calculateDistance(sourceCoords, destCoords);
-        console.log(`Route distance: ${routeDistance.toFixed(2)} km`);
-
-        // Process intermediate places
-        const validatedPlaces = await Promise.all(
-          trip.tripData.intermediate_places.map(async (place) => {
-            try {
-              const placeName = place?.place_name || place?.place || place?.name || "";
-              if (!placeName) return null;
-
-              console.log(`Validating place: ${placeName}`);
-
-              // Get coordinates for the place
-              const placeCoords = await getCoordinatesFromAddress(placeName);
-              if (!placeCoords) {
-                console.log(`Could not get coordinates for: ${placeName}`);
-                return null;
-              }
-
-              console.log(`${placeName} coordinates: ${placeCoords.lat},${placeCoords.lng}`);
-
-              // Check if place is between source and destination
-              const isBetween = isPlaceBetween(sourceCoords, destCoords, placeCoords, routeDistance);
-              
-              if (isBetween) {
-                console.log(`${placeName} is valid on the route`);
-                // Add coordinates to the place object if it doesn't have them
-                if (!place.geo_coordinates) {
-                  place.geo_coordinates = `${placeCoords.lat},${placeCoords.lng}`;
-                }
-                return place;
-              } else {
-                console.log(`${placeName} is NOT on the route`);
-                return null;
-              }
-            } catch (error) {
-              console.error(`Error processing place: ${place?.place_name || place?.place || place?.name}`, error);
-              return null;
-            }
-          })
-        );
-
-        // Filter out null values (places that couldn't be processed or aren't between)
-        const filteredPlaces = validatedPlaces.filter(place => place !== null);
-        setValidIntermediatePlaces(filteredPlaces);
-        console.log(`Found ${filteredPlaces.length} valid places on the route`);
       } catch (error) {
-        console.error("Error validating intermediate places:", error);
+        console.error("Error finding places:", error);
         setError(error.message);
-        setValidIntermediatePlaces([]);
+        // If error occurs, use fallback data
+        const fallbackPlaces = getManualPlacesAlongRoute(
+          trip.userSelection.source.label, 
+          trip.userSelection.location.label
+        );
+        setIntermediateOptions(fallbackPlaces);
       } finally {
         setIsLoading(false);
       }
-    }
+    };
 
-    validateIntermediatePlaces();
+    fetchInterestingPlaces();
   }, [trip]);
 
-  // Function to get coordinates from an address using Google Geocoding API
-  async function getCoordinatesFromAddress(address) {
-    if (!address) return null;
+  // Function to generate OpenAI prompt for place recommendations
+  function generateOpenAIPrompt(source, destination) {
+    return `Generate 5 interesting tourist places, attractions, or landmarks to visit between ${source} and ${destination} in India. 
+    
+These should be actual places along or near the route that travelers might stop at during their journey. 
+    
+Return the data as a JSON array of objects with this structure:
+[
+  {
+    "name": "Place Name",
+    "place": "Place Name",
+    "details": "Brief description of the place (1-2 sentences)",
+    "best_time_to_visit": "Best time to visit/opening hours",
+    "ticket_pricing": "Entry fee or 'Free' if applicable",
+    "rating": "4.5"
+  }
+]
 
-    // Check if we already have coordinates for this place in the trip data
-    if (trip.tripData.intermediate_places) {
-      const existingPlace = trip.tripData.intermediate_places.find(p => {
-        const placeName = p?.place_name || p?.place || p?.name || "";
-        return placeName.toLowerCase() === address.toLowerCase() && p.geo_coordinates;
-      });
+Only include places that are actually between these two locations. Do NOT include places in either ${source} or ${destination} themselves. Ensure places are geographically between or reasonably near the route from ${source} to ${destination}.`;
+  }
 
-      if (existingPlace && existingPlace.geo_coordinates) {
-        // Handle different formats of geo_coordinates
-        if (typeof existingPlace.geo_coordinates === 'string') {
-          const [lat, lng] = existingPlace.geo_coordinates.split(',').map(parseFloat);
-          return { lat, lng };
-        } else if (existingPlace.geo_coordinates.latitude && existingPlace.geo_coordinates.longitude) {
-          return { 
-            lat: parseFloat(existingPlace.geo_coordinates.latitude), 
-            lng: parseFloat(existingPlace.geo_coordinates.longitude) 
-          };
+  // Function to get place recommendations from OpenAI
+  async function getPlacesFromOpenAI(prompt) {
+    try {
+      const result = await chatSession.sendMessage(prompt);
+      const responseText = result.response.text();
+      
+      // Parse the JSON from the response
+      let parsedResult;
+      try {
+        // Find JSON in the response text
+        const jsonMatch = responseText.match(/\[[\s\S]*\]/);
+        if (jsonMatch) {
+          parsedResult = JSON.parse(jsonMatch[0]);
+        } else {
+          // If no JSON array found, try parsing the entire response
+          parsedResult = JSON.parse(responseText);
         }
+      } catch (parseError) {
+        console.error("Error parsing OpenAI response:", parseError);
+        console.log("Raw response:", responseText);
+        return [];
+      }
+      
+      // If the response is an object with places property, use that
+      if (Array.isArray(parsedResult)) {
+        return parsedResult;
+      } else if (parsedResult.places && Array.isArray(parsedResult.places)) {
+        return parsedResult.places;
+      } else {
+        console.error("Unexpected response format from OpenAI");
+        return [];
+      }
+    } catch (error) {
+      console.error("Error calling OpenAI:", error);
+      return [];
+    }
+  }
+
+  // Function to validate and enhance places with Google Geocoding API
+  async function validatePlacesWithGeocoding(places, source, destination) {
+    const validatedPlaces = [];
+    
+    // First, geocode source and destination
+    const sourceCoords = await geocodeLocation(source);
+    const destCoords = await geocodeLocation(destination);
+    
+    if (!sourceCoords || !destCoords) {
+      console.warn("Could not geocode source or destination");
+      return places; // Return original places if geocoding fails
+    }
+    
+    // Process each place
+    for (const place of places) {
+      try {
+        // Geocode the place
+        const searchTerm = `${place.name} ${place.place || ''} India`;
+        const placeCoords = await geocodeLocation(searchTerm);
+        
+        if (!placeCoords) {
+          console.warn(`Could not geocode place: ${place.name}`);
+          continue; // Skip this place
+        }
+        
+        // Check if place is between source and destination
+        if (isPlaceBetween(sourceCoords, destCoords, placeCoords)) {
+          // Enhanced place with coordinates
+          validatedPlaces.push({
+            ...place,
+            place_name: place.name,
+            geo_coordinates: `${placeCoords.lat},${placeCoords.lng}`,
+            time: place.best_time_to_visit || "All day"
+          });
+        } else {
+          console.log(`Place not between source and destination: ${place.name}`);
+        }
+      } catch (error) {
+        console.error(`Error processing place ${place.name}:`, error);
       }
     }
+    
+    // If no places could be validated, return original list
+    if (validatedPlaces.length === 0) {
+      return places.map(place => ({
+        ...place,
+        place_name: place.name,
+        time: place.best_time_to_visit || "All day"
+      }));
+    }
+    
+    return validatedPlaces;
+  }
 
+  // Function to geocode a location name to coordinates
+  async function geocodeLocation(locationName) {
     try {
       const response = await axios.get(
         `https://maps.googleapis.com/maps/api/geocode/json`,
         {
           params: {
-            address: address,
+            address: locationName,
             key: API_KEY
           }
         }
       );
 
       if (response.data.status === 'OK' && response.data.results.length > 0) {
-        const location = response.data.results[0].geometry.location;
-        return {
-          lat: location.lat,
-          lng: location.lng
-        };
+        return response.data.results[0].geometry.location;
       } else {
-        console.warn(`Geocoding failed for ${address}: ${response.data.status}`);
+        console.warn(`Geocoding failed for ${locationName}: ${response.data.status}`);
         return null;
       }
     } catch (error) {
-      console.error(`Error geocoding address ${address}:`, error);
+      console.error(`Error geocoding ${locationName}:`, error);
       return null;
     }
   }
 
-  // Calculate great-circle distance between two points using Haversine formula
-  function calculateDistance(pointA, pointB) {
-    const toRad = value => value * Math.PI / 180;
-    const R = 6371; // Earth's radius in km
-    const dLat = toRad(pointB.lat - pointA.lat);
-    const dLng = toRad(pointB.lng - pointA.lng);
-    
-    const a = 
-      Math.sin(dLat/2) * Math.sin(dLat/2) +
-      Math.cos(toRad(pointA.lat)) * Math.cos(toRad(pointB.lat)) * 
-      Math.sin(dLng/2) * Math.sin(dLng/2);
-    
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-    return R * c; // Distance in km
-  }
-
   // Function to check if a place is geographically between source and destination
-  function isPlaceBetween(sourceCoords, destCoords, placeCoords, routeDistance) {
+  function isPlaceBetween(source, destination, placeCoords) {
     // Create a bounding box for the route with buffer
-    const minLat = Math.min(sourceCoords.lat, destCoords.lat);
-    const maxLat = Math.max(sourceCoords.lat, destCoords.lat);
-    const minLng = Math.min(sourceCoords.lng, destCoords.lng);
-    const maxLng = Math.max(sourceCoords.lng, destCoords.lng);
+    const minLat = Math.min(source.lat, destination.lat);
+    const maxLat = Math.max(source.lat, destination.lat);
+    const minLng = Math.min(source.lng, destination.lng);
+    const maxLng = Math.max(source.lng, destination.lng);
     
-    // Add a buffer zone (dynamically scaled based on route distance)
-    // For short routes, use at least 0.5 degrees buffer
-    // For longer routes, use 15% of the route distance
-    const buffer = Math.max(0.5, routeDistance * 0.15 / 111); // Convert km to degrees (1 degree ≈ 111 km)
+    // Add a buffer zone (0.5 degrees, roughly 55km)
+    const buffer = 0.5;
     
     // Check if place is within the bounding box (with buffer)
     const isWithinBox = 
@@ -251,23 +285,178 @@ function IntermediatePlaces({ trip }) {
       return false;
     }
     
-    // Calculate distance from source to place
-    const sourceToPlaceDistance = calculateDistance(sourceCoords, placeCoords);
+    // Check if place isn't too close to source or destination (within 10km)
+    const distanceToSource = calculateDistance(placeCoords, source);
+    const distanceToDestination = calculateDistance(placeCoords, destination);
     
-    // Calculate distance from place to destination
-    const placeToDestDistance = calculateDistance(placeCoords, destCoords);
+    if (distanceToSource < 10 || distanceToDestination < 10) {
+      return false;
+    }
     
-    // Check if the place is roughly on the path by comparing the sum of 
-    // source-to-place and place-to-destination distances with the direct route distance
-    // Allow for some detour (e.g., 30% longer than the direct route)
-    const detourFactor = 1.3;
-    const isOnRoute = (sourceToPlaceDistance + placeToDestDistance) <= (routeDistance * detourFactor);
+    // Calculate route distance to check if detour is reasonable
+    const routeDistance = calculateDistance(source, destination);
+    const detourDistance = distanceToSource + distanceToDestination;
     
-    return isOnRoute;
+    // Allow a detour that's at most 50% longer than the direct route
+    return detourDistance <= routeDistance * 1.5;
   }
 
-  // Don't render anything if no intermediate places or still loading with no data
-  if ((!validIntermediatePlaces.length && !isLoading) || !trip) {
+  // Calculate distance between two points using Haversine formula
+  function calculateDistance(point1, point2) {
+    const toRad = value => value * Math.PI / 180;
+    const R = 6371; // Earth's radius in km
+    const dLat = toRad(point2.lat - point1.lat);
+    const dLng = toRad(point2.lng - point1.lng);
+    
+    const a = 
+      Math.sin(dLat/2) * Math.sin(dLat/2) +
+      Math.cos(toRad(point1.lat)) * Math.cos(toRad(point2.lat)) * 
+      Math.sin(dLng/2) * Math.sin(dLng/2);
+    
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+    return R * c; // Distance in km
+  }
+
+  // Fallback function with manually curated list of popular places between major cities
+  function getManualPlacesAlongRoute(source, destination) {
+    // Convert source and destination to lowercase for easier comparison
+    const sourceLower = source.toLowerCase();
+    const destLower = destination.toLowerCase();
+    
+    // Popular routes in India with intermediate places
+    let places = [];
+    
+    // Kolkata to Delhi route
+    if ((sourceLower.includes('kolkata') && destLower.includes('delhi')) || 
+        (sourceLower.includes('delhi') && destLower.includes('kolkata'))) {
+      places = [
+        {
+          name: 'Bodh Gaya',
+          place_name: 'Bodh Gaya',
+          place: 'Bodh Gaya',
+          geo_coordinates: '24.6961,84.9923',
+          details: 'Bodh Gaya is a Buddhist pilgrimage site associated with Gautama Buddha\'s attainment of Enlightenment.',
+          rating: '4.7',
+          ticket_pricing: 'Free (Temple entry)',
+          time: '6 AM - 9 PM'
+        },
+        {
+          name: 'Varanasi',
+          place_name: 'Varanasi',
+          place: 'Varanasi',
+          geo_coordinates: '25.3176,83.0130',
+          details: 'One of the oldest continuously inhabited cities in the world and a major religious hub in India.',
+          rating: '4.6',
+          ticket_pricing: 'Free (Most ghats)',
+          time: 'Best at sunrise/sunset'
+        },
+        {
+          name: 'Allahabad (Prayagraj)',
+          place_name: 'Allahabad',
+          place: 'Allahabad',
+          geo_coordinates: '25.4358,81.8464',
+          details: 'The "City of Prime Ministers" is a sacred city situated at the confluence of three rivers.',
+          rating: '4.4',
+          ticket_pricing: 'Free (Most sites)',
+          time: 'All day'
+        },
+        {
+          name: 'Agra',
+          place_name: 'Agra',
+          place: 'Agra',
+          geo_coordinates: '27.1767,78.0081',
+          details: 'Home to the iconic Taj Mahal, Agra Fort, and Fatehpur Sikri.',
+          rating: '4.8',
+          ticket_pricing: 'Varies by monument',
+          time: 'Sunrise to sunset'
+        },
+        {
+          name: 'Jaipur',
+          place_name: 'Jaipur',
+          place: 'Jaipur',
+          geo_coordinates: '26.9124,75.7873',
+          details: 'The Pink City with magnificent forts, palaces, and vibrant markets.',
+          rating: '4.7',
+          ticket_pricing: 'Varies by site',
+          time: '9 AM - 5 PM'
+        }
+      ];
+    }
+    // Mumbai to Delhi route
+    else if ((sourceLower.includes('mumbai') && destLower.includes('delhi')) || 
+             (sourceLower.includes('delhi') && destLower.includes('mumbai'))) {
+      places = [
+        {
+          name: 'Udaipur',
+          place_name: 'Udaipur',
+          place: 'Udaipur',
+          geo_coordinates: '24.5854,73.7125',
+          details: 'Known as the "City of Lakes" with beautiful palaces and picturesque settings.',
+          rating: '4.8',
+          ticket_pricing: 'Varies by palace/museum',
+          time: '9 AM - 5 PM'
+        },
+        {
+          name: 'Jaipur',
+          place_name: 'Jaipur',
+          place: 'Jaipur',
+          geo_coordinates: '26.9124,75.7873',
+          details: 'The Pink City with magnificent forts, palaces, and vibrant markets.',
+          rating: '4.7',
+          ticket_pricing: 'Varies by site',
+          time: '9 AM - 5 PM'
+        },
+        {
+          name: 'Ajmer',
+          place_name: 'Ajmer',
+          place: 'Ajmer',
+          geo_coordinates: '26.4499,74.6399',
+          details: 'Home to the famous Ajmer Sharif Dargah and surrounded by Aravalli Hills.',
+          rating: '4.5',
+          ticket_pricing: 'Free (Dargah)',
+          time: 'All day'
+        }
+      ];
+    }
+    // Generic fallback for other routes
+    else {
+      places = [
+        {
+          name: 'Tourist Attraction',
+          place_name: 'Tourist Attraction',
+          place: 'Tourist Attraction',
+          geo_coordinates: '', // Will be filled if we can geocode
+          details: `Interesting place to visit on your way from ${source} to ${destination}.`,
+          rating: '4.5',
+          ticket_pricing: 'Check at location',
+          time: 'All day'
+        }
+      ];
+      
+      // Try to geocode source and destination to get midpoint
+      geocodeLocation(source).then(sourceCoords => {
+        if (sourceCoords) {
+          geocodeLocation(destination).then(destCoords => {
+            if (destCoords) {
+              const midLat = (sourceCoords.lat + destCoords.lat) / 2;
+              const midLng = (sourceCoords.lng + destCoords.lng) / 2;
+              places[0].geo_coordinates = `${midLat},${midLng}`;
+              
+              // Update state if this happens after initial render
+              if (intermediateOptions.length > 0 && !intermediateOptions[0].geo_coordinates) {
+                setIntermediateOptions([...places]);
+              }
+            }
+          });
+        }
+      });
+    }
+    
+    return places;
+  }
+
+  // Don't render anything if no intermediate options or still loading with no data
+  if (!intermediateOptions.length && !isLoading) {
     return null;
   }
 
@@ -283,40 +472,45 @@ function IntermediatePlaces({ trip }) {
       {isLoading ? (
         <div className="flex justify-center items-center p-10">
           <FaSpinner className="animate-spin text-blue-500 mr-2" />
-          <span>Validating places on your route...</span>
+          <span>Finding interesting places along your route...</span>
         </div>
       ) : error ? (
-        <div className="bg-red-50 p-4 rounded-lg mb-6 flex items-start">
-          <div className="text-red-500 mr-3 mt-1">
+        <div className="bg-yellow-50 p-4 rounded-lg mb-6 flex items-start">
+          <div className="text-yellow-500 mr-3 mt-1">
             <FaInfoCircle />
           </div>
-          <p className="text-red-700">
-            {error}
-          </p>
-        </div>
-      ) : (
-        <>
-          <div className="bg-blue-50 p-4 rounded-lg mb-6 flex items-start">
-            <div className="text-blue-500 mr-3 mt-1">
-              <FaMapMarkerAlt />
-            </div>
-            <p className="text-blue-700">
-              These are interesting places you can visit on your way from {trip?.userSelection?.source?.label} to {trip?.userSelection?.location?.label}. 
-              Each location has been verified to be along your route.
+          <div>
+            <p className="text-yellow-700 font-medium">Couldn't find new places</p>
+            <p className="text-yellow-600 text-sm mt-1">
+              {error}. Showing default recommendations.
             </p>
           </div>
-          
-          <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-6">
-            {validIntermediatePlaces.map((place, index) => (
-              <div key={index} className="border border-gray-200 rounded-lg overflow-hidden hover:shadow-md transition-shadow">
-                <PlaceCardItem place={place} />
-              </div>
-            ))}
+        </div>
+      ) : (
+        <div className="bg-blue-50 p-4 rounded-lg mb-6 flex items-start">
+          <div className="text-blue-500 mr-3 mt-1">
+            <FaMapMarkerAlt />
           </div>
-        </>
+          <p className="text-blue-700">
+            These are interesting places you can visit on your way from {trip?.userSelection?.source?.label} to {trip?.userSelection?.location?.label}. 
+            Consider adding some of these stops to break up your journey.
+          </p>
+        </div>
+      )}
+      
+      {intermediateOptions.length > 0 && (
+        <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-6">
+          {intermediateOptions.map((place, index) => (
+            <div key={index} className="border border-gray-200 rounded-lg overflow-hidden hover:shadow-md transition-shadow">
+              <PlaceCardItem place={place} />
+            </div>
+          ))}
+        </div>
       )}
     </div>
   );
 }
 
 export default IntermediatePlaces;
+
+
